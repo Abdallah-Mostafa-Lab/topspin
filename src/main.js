@@ -1,6 +1,8 @@
 import * as THREE from 'three';
 import * as P from './physics.js';
 import { Panel, C, FONT_D, FONT_B } from './panel.js';
+import { buildPaddle, overBlade, BLADE } from './paddleModel.js';
+import { analyze, frameRow, vround, replayWindow } from './debug.js';
 import { initAudio, sfx, setEnabled as setSound } from './audio.js';
 
 const { TABLE, BALL_R } = P;
@@ -17,7 +19,7 @@ const PRESETS = {
 };
 const settings = Object.assign({
   preset: 'assisted', assist: 'light', speed: 0.85, spinFx: true, space: 'standard',
-  hand: 'right', angle: 0, sound: true, difficulty: 'medium', weight: 75,
+  hand: 'right', angle: 0, sound: true, difficulty: 'medium', weight: 75, readout: true, recorder: true,
 }, store.get('settings', {}));
 const bests = store.get('bests', {});
 function saveSettings() {
@@ -132,20 +134,11 @@ const target = new THREE.Group();
 const TARGET_R = 0.2;
 
 // ---------------------------------------------------------------- paddle
-const BLADE_R = 0.077;
-const BLADE_C = new THREE.Vector3(0, 0, -0.155); // blade centre in paddle-mount space; face normal is the mount's X axis
+// Blade outline and collision live in paddleModel.js; the face normal is the mount's X axis.
+const BLADE_C = BLADE.c;
 const paddle = new THREE.Group(); // the mount: rotation.x = paddle angle setting
-{
-  const wood = new THREE.MeshStandardMaterial({ color: '#c9a36b', roughness: 0.7 });
-  const handle = new THREE.Mesh(new THREE.BoxGeometry(0.024, 0.032, 0.105), wood); handle.position.z = -0.03; paddle.add(handle);
-  const blade = new THREE.Mesh(new THREE.CylinderGeometry(BLADE_R, BLADE_R, 0.006, 40), wood);
-  blade.rotation.z = Math.PI / 2; blade.scale.set(1, 1, 1.04); blade.position.copy(BLADE_C); paddle.add(blade);
-  const rubber = (color, side) => {
-    const r = new THREE.Mesh(new THREE.CylinderGeometry(BLADE_R - 0.002, BLADE_R - 0.002, 0.003, 40), new THREE.MeshStandardMaterial({ color, roughness: 0.8 }));
-    r.rotation.z = Math.PI / 2; r.scale.set(1, 1, 1.04); r.position.copy(BLADE_C); r.position.x = side * 0.0045; paddle.add(r);
-  };
-  rubber('#c8202c', 1); rubber('#15171a', -1);
-}
+const paddleModel = buildPaddle();
+paddle.add(paddleModel.group);
 const desktopHolder = new THREE.Group(); scene.add(desktopHolder);
 const offHandMarker = new THREE.Mesh(new THREE.SphereGeometry(0.025, 16, 12), new THREE.MeshStandardMaterial({ color: '#9fb6cf' }));
 
@@ -208,7 +201,7 @@ const S = {
   headDist: 0, swings: 0, lastHead: null, swingArmed: true,
   result: null,
 };
-const MODE_NAME = { drills: 'Target Drills', rally: 'Rally Survival' };
+const MODE_NAME = { drills: 'Target Drills', rally: 'Rally Survival', practice: 'Topspin Practice' };
 const cap = s => s[0].toUpperCase() + s.slice(1);
 const bestKey = () => `${S.mode}.${settings.difficulty}`;
 
@@ -219,6 +212,11 @@ function resetRun() {
 }
 function startMode(mode) {
   S.mode = mode; resetRun();
+  if (mode === 'practice') {
+    // the same topspin ball every time, to your forehand side
+    const spin = P.v3(200, 0, 0), tx = settings.hand === 'left' ? -0.3 : 0.3;
+    S.practiceShot = { v: P.solveShot(NOZZLE, tx, 0.85, spin, 0.6), spin };
+  }
   S.screen = 'playing';
   S.nextFeedAt = 1.5;
   placeTarget();
@@ -250,16 +248,23 @@ function makeShot(level) {
   const v = P.solveShot(NOZZLE, tx, tz, t.spin, rand(...t.T) * pace) || P.solveShot(NOZZLE, 0, 0.8, P.v3(), 0.8);
   return { v, spin: t.spin };
 }
+function shotLevel() { return S.mode === 'rally' ? DIFF_LEVEL[settings.difficulty] + S.rally : DIFF_LEVEL[settings.difficulty]; }
+function nextShot() { return S.mode === 'practice' ? { v: P.copy(S.practiceShot.v), spin: P.copy(S.practiceShot.spin) } : makeShot(shotLevel()); }
 function feed() {
-  const level = S.mode === 'rally' ? DIFF_LEVEL[settings.difficulty] + S.rally : DIFF_LEVEL[settings.difficulty];
-  const shot = S.pendingShot || makeShot(level);
+  const shot = S.pendingShot || nextShot();
   S.pendingShot = null;
   S.cur = spawnBall(NOZZLE, shot.v, shot.spin);
+  S.rec = S.cur.rec = {
+    t0: S.time, at: Date.now(), session: SESSION, mode: S.mode, level: shotLevel(), hand: settings.hand, angle: settings.angle,
+    speed: settings.speed, assist: settings.assist, redSign: redSign(), feed: { v: vround(shot.v), spin: vround(shot.spin) },
+    frames: [], hits: [], outcome: null, land: null, finalizeAt: Infinity, done: false,
+  };
   S.fed++;
   sfx.launch();
   S.nextFeedAt = Infinity;
 }
 function feedGap() {
+  if (S.mode === 'practice') return 1.3;
   if (S.mode === 'rally') return Math.max(0.5, 1.15 - S.rally * 0.02);
   return { easy: 1.4, medium: 1.1, hard: 0.85 }[settings.difficulty];
 }
@@ -268,6 +273,17 @@ function feedGap() {
 function resolve(o, outcome, x, z) {
   if (o.phase === 'done') return;
   o.phase = 'done';
+  if (o.rec && !o.rec.done) {
+    o.rec.outcome = outcome;
+    o.rec.land = x !== undefined ? { x: Math.round(x * 1000) / 1000, z: Math.round(z * 1000) / 1000 } : null;
+    o.rec.finalizeAt = S.time + 0.3; // keep recording the follow-through briefly
+  }
+  if (S.mode === 'practice') {
+    if (outcome === 'good') { S.onTable++; S.streak++; popup('+1', C.fg, x, z); sfx.good(); }
+    else { S.streak = 0; const p = o.b ? o.b.p : P.v3(0, 0, L / 2); popup({ net: 'NET', out: 'OUT', own: 'OWN SIDE', miss: 'MISSED' }[outcome], C.bad, Math.max(-0.7, Math.min(0.7, p.x)), outcome === 'miss' ? L / 2 - 0.2 : Math.max(-1.2, Math.min(1.2, p.z))); sfx.bad(); }
+    S.nextFeedAt = S.time + feedGap();
+    return;
+  }
   if (outcome === 'good') {
     S.onTable++; S.streak++; S.bestStreak = Math.max(S.bestStreak, S.streak);
     if (S.mode === 'drills') {
@@ -321,16 +337,19 @@ const screens = {
     p.frame();
     p.text('TOPSPIN VR', 70, 135, { size: 110, font: FONT_D, weight: 700 });
     p.text('Table tennis workout', 72, 185, { size: 34, color: C.dim });
-    p.button('drills', 'TARGET DRILLS', 70, 240, 470, 120, { primary: true, size: 46, onClick: () => startMode('drills') });
-    p.button('rally', 'RALLY SURVIVAL', 560, 240, 470, 120, { primary: true, size: 46, onClick: () => startMode('rally') });
-    p.text('25 balls · hit the orange ring for 5', 72, 400, { size: 26, color: C.dim });
-    p.text('Endless rally · one miss ends it', 562, 400, { size: 26, color: C.dim });
+    p.button('drills', 'TARGET DRILLS', 70, 240, 306, 120, { primary: true, size: 38, onClick: () => startMode('drills') });
+    p.button('rally', 'RALLY SURVIVAL', 397, 240, 306, 120, { primary: true, size: 38, onClick: () => startMode('rally') });
+    p.button('practice', 'TOPSPIN PRACTICE', 724, 240, 306, 120, { size: 36, onClick: () => startMode('practice') });
+    p.text('25 balls · ring scores 5', 72, 400, { size: 25, color: C.dim });
+    p.text('One miss ends the run', 399, 400, { size: 25, color: C.dim });
+    p.text('Same topspin ball, endless', 726, 400, { size: 25, color: C.dim });
     label(p, 'Level', 450); seg(p, 'difficulty', [['easy', 'EASY'], ['medium', 'MEDIUM'], ['hard', 'HARD']], settings.difficulty, 450, 250, 250);
     const bd = bests[`drills.${settings.difficulty}`], br = bests[`rally.${settings.difficulty}`];
     p.text(`Best · Drills ${bd ?? '—'} · Rally ${br ?? '—'}`, 72, 580, { size: 30, color: C.fg });
-    p.button('settings', 'SETTINGS', 70, 630, 300, 90, { onClick: () => { S.screen = 'settings'; showScreen(); } });
-    p.button('recenter', 'RECENTER TABLE', 390, 630, 380, 90, { onClick: recenter });
-    if (xrSession) p.button('exit', 'EXIT', 790, 630, 240, 90, { onClick: () => xrSession.end() });
+    p.button('settings', 'SETTINGS', 70, 630, 220, 90, { onClick: () => { S.screen = 'settings'; showScreen(); } });
+    p.button('debug', 'DEBUG', 305, 630, 200, 90, { onClick: () => { S.returnTo = 'main'; S.screen = 'debug'; showScreen(); } });
+    p.button('recenter', 'RECENTER', 520, 630, 300, 90, { onClick: recenter });
+    if (xrSession) p.button('exit', 'EXIT', 835, 630, 195, 90, { onClick: () => xrSession.end() });
     p.text(xrSession ? 'Point and pull the trigger · B or Y pauses' : 'Click to choose · Esc pauses', 72, 770, { size: 26, color: C.dim });
   },
   settings(p) {
@@ -361,6 +380,25 @@ const screens = {
     p.button('settings', 'SETTINGS', 70, 390, 470, 100, { onClick: () => { S.returnTo = 'paused'; S.screen = 'settings'; showScreen(); } });
     p.button('recenter', 'RECENTER TABLE', 560, 390, 470, 100, { onClick: recenter });
     p.button('quit', 'QUIT TO MENU', 70, 520, 470, 100, { onClick: () => { S.screen = 'main'; resetRun(); target.visible = false; showScreen(); } });
+    if (S.lastRec) p.button('replay', 'REPLAY LAST SHOT', 560, 520, 470, 100, { onClick: startReplay });
+    p.button('debug', 'DEBUG', 70, 650, 470, 100, { onClick: () => { S.returnTo = 'paused'; S.screen = 'debug'; showScreen(); } });
+    p.text('A or X replays the last shot', 562, 712, { size: 26, color: C.dim });
+  },
+  debug(p) {
+    p.frame();
+    p.text('DEBUG', 70, 115, { size: 80, font: FONT_D, weight: 700 });
+    label(p, 'Shot readout', 160); seg(p, 'readout', [[true, 'ON'], [false, 'OFF']], settings.readout, 160, 380, 316);
+    p.text('A panel to your left explains every shot', 72, 270, { size: 26, color: C.dim });
+    label(p, 'Swing recorder', 300); seg(p, 'recorder', [[true, 'ON'], [false, 'OFF']], settings.recorder, 300, 380, 316);
+    const st = !settings.recorder ? 'Off: nothing is saved'
+      : dbState === 'on' ? `Saving to your TopSpin VR page · ${savedCount} shot${savedCount === 1 ? '' : 's'} saved`
+      : dbState === 'connecting' ? 'Connecting…'
+      : dbState === 'unavailable' ? 'Not available here: open the published page while signed in'
+      : `Couldn't save (${dbState}). Shots still show in the readout.`;
+    p.text(st, 72, 410, { size: 26, color: dbState === 'on' || !settings.recorder ? C.dim : C.bad });
+    if (S.lastRec) p.button('replay', 'REPLAY LAST SHOT', 70, 460, 470, 100, { onClick: startReplay });
+    p.button('practice', 'TOPSPIN PRACTICE', 560, 460, 470, 100, { onClick: () => startMode('practice') });
+    p.button('back', 'DONE', 70, 640, 300, 90, { primary: true, onClick: () => { S.screen = S.returnTo || 'main'; S.returnTo = null; showScreen(); } });
   },
   results(p) {
     const r = S.result;
@@ -387,15 +425,16 @@ const screens = {
 };
 function showScreen() {
   const interactive = S.screen !== 'playing';
-  menu.mesh.visible = interactive;
-  if (interactive) menu.setDraw(screens[S.screen]);
+  menu.mesh.visible = interactive && S.screen !== 'replay';
+  if (menu.mesh.visible) menu.setDraw(screens[S.screen]);
   hud.mesh.visible = S.screen === 'playing' || S.screen === 'paused';
+  drawReadout();
   document.body.classList.toggle('paused', S.screen !== 'playing');
   rays.forEach(r => { r.visible = interactive && !!xrSession; });
 }
 let hudKey = '';
 function drawHud() {
-  const key = S.mode === 'drills' ? `${S.score}|${S.streak}|${S.fed}` : `${S.rally}`;
+  const key = `${S.mode}|${S.score}|${S.streak}|${S.fed}|${S.rally}|${S.onTable}`;
   if (key === hudKey) return; hudKey = key;
   hud.setDraw(p => {
     const ctx = p.ctx; ctx.fillStyle = C.bg; ctx.beginPath(); ctx.roundRect(4, 4, p.W - 8, p.H - 8, 24); ctx.fill();
@@ -405,6 +444,9 @@ function drawHud() {
       p.text('POINTS', 60 + p.ctx.measureText(String(S.score)).width + 18, 140, { size: 40, font: FONT_D, color: C.dim });
       p.text(`×${mult}`, 640, 140, { size: 90, font: FONT_D, weight: 700, align: 'center', color: mult > 1 ? C.fg : C.dim });
       p.text(`${Math.min(S.fed, S.setSize)}/${S.setSize}`, 964, 140, { size: 80, font: FONT_D, weight: 700, align: 'right' });
+    } else if (S.mode === 'practice') {
+      p.text('TOPSPIN PRACTICE', 60, 135, { size: 56, font: FONT_D, color: C.dim });
+      p.text(`${S.onTable} / ${S.fed}`, 964, 140, { size: 90, font: FONT_D, weight: 700, align: 'right', color: C.accent });
     } else {
       p.text('RALLY', 60, 135, { size: 56, font: FONT_D, color: C.dim });
       p.text(String(S.rally), 512, 150, { size: 140, font: FONT_D, weight: 700, align: 'center', color: C.accent });
@@ -432,6 +474,9 @@ let paddleIdx = -1;
 function applyHand() {
   paddle.rotation.x = THREE.MathUtils.degToRad(settings.angle);
   paddle.visible = true;
+  // Forehand rubber (red) goes on the palm side. In WebXR grip space +X points to the right,
+  // so for a right hand the palm faces -X and for a left hand +X.
+  paddleModel.setRedSide(settings.hand === 'left' ? 1 : -1);
   if (!xrSession) { desktopHolder.add(paddle); paddleIdx = -1; return; }
   let idx = handOf.indexOf(settings.hand);
   if (idx < 0) idx = handOf.findIndex(h => h);
@@ -444,12 +489,18 @@ function applyHand() {
 
 const raycaster = new THREE.Raycaster();
 const tmpM = new THREE.Matrix4();
+// Returns the button under a ray on whichever panel is interactive (menu, or the readout during replay).
 function pointAt(origin, dir) {
-  if (!menu.mesh.visible) return null;
+  const panels = [menu, readPanel].filter(pn => pn.mesh.visible && pn.buttons.length);
+  if (!panels.length) return null;
   raycaster.set(origin, dir);
-  const hit = raycaster.intersectObject(menu.mesh)[0];
-  return hit ? menu.hitTest(hit.uv) : null;
+  const hit = raycaster.intersectObjects(panels.map(pn => pn.mesh))[0];
+  if (!hit) return null;
+  const pn = panels.find(x => x.mesh === hit.object);
+  const b = pn.hitTest(hit.uv);
+  return b ? { ...b, panel: pn } : null;
 }
+function setHovers(b) { menu.setHover(b && b.panel === menu ? b.id : null); readPanel.setHover(b && b.panel === readPanel ? b.id : null); }
 const hoverBy = [null, null];
 ctrls.forEach((c, i) => c.addEventListener('selectstart', () => {
   initAudio();
@@ -463,9 +514,9 @@ function updateXRPointers() {
     tmpM.identity().extractRotation(c.matrixWorld);
     const o = new THREE.Vector3().setFromMatrixPosition(c.matrixWorld);
     const d = new THREE.Vector3(0, 0, -1).applyMatrix4(tmpM);
-    const b = pointAt(o, d); hoverBy[i] = b; if (b) hov = b.id;
+    const b = pointAt(o, d); hoverBy[i] = b; if (b) hov = b;
   });
-  menu.setHover(hov);
+  setHovers(hov);
 }
 function pulse(i, strength, ms) {
   try { sourceOf[i]?.gamepad?.hapticActuators?.[0]?.pulse(strength, ms); } catch { /* no haptics */ }
@@ -477,7 +528,8 @@ function pollButtons() {
     const i = sourceOf.indexOf(src); if (i < 0 || !src.gamepad) continue;
     const pressed = src.gamepad.buttons.map(b => b.pressed);
     const edge = n => pressed[n] && !prevButtons[i][n];
-    if (edge(5)) togglePause();
+    if (edge(5)) { if (S.screen === 'replay') exitReplay(); else togglePause(); }
+    if (edge(4)) { if (S.screen === 'replay') exitReplay(); else if (S.lastRec && (S.screen === 'playing' || S.screen === 'paused')) startReplay(); }
     prevButtons[i] = pressed;
   }
 }
@@ -538,7 +590,7 @@ canvas.addEventListener('pointermove', e => {
   if (!desktopActive) return;
   raycaster.setFromCamera(mouse, camera);
   const b = pointAt(raycaster.ray.origin, raycaster.ray.direction);
-  menu.setHover(b ? b.id : null);
+  setHovers(b);
   canvas.style.cursor = b ? 'pointer' : 'default';
 });
 canvas.addEventListener('pointerdown', e => {
@@ -550,6 +602,8 @@ canvas.addEventListener('pointerdown', e => {
 });
 addEventListener('pointerup', () => { swingDown = false; });
 addEventListener('keydown', e => {
+  if ((e.key === 'r' || e.key === 'R') && desktopActive) { if (S.screen === 'replay') exitReplay(); else if (S.lastRec && (S.screen === 'playing' || S.screen === 'paused')) startReplay(); }
+  if (e.key === 'Escape' && desktopActive && S.screen === 'replay') { exitReplay(); return; }
   if (e.key === 'Escape' && desktopActive) {
     if (S.screen === 'playing' || S.screen === 'paused') togglePause();
     else if (S.screen === 'main') { desktopActive = false; document.body.classList.remove('in-game'); }
@@ -594,7 +648,7 @@ function readPaddlePose() {
   padM.decompose(padCur.p, padCur.q, sc);
   return true;
 }
-const ip = new THREE.Vector3(), iq = new THREE.Quaternion(), bc = new THREE.Vector3(), bn = new THREE.Vector3();
+const ip = new THREE.Vector3(), iq = new THREE.Quaternion(), bc = new THREE.Vector3(), bn = new THREE.Vector3(), bu = new THREE.Vector3(), bv = new THREE.Vector3();
 function interpPose(a) {
   ip.lerpVectors(padPrev.p, padCur.p, a); iq.slerpQuaternions(padPrev.q, padCur.q, a);
   bc.copy(BLADE_C).applyQuaternion(iq).add(ip);
@@ -614,28 +668,39 @@ function collidePaddle(o, a, frameDt, simScale) {
   const bp = new THREE.Vector3(o.b.p.x, o.b.p.y, o.b.p.z);
   const d = bp.clone().sub(bc);
   const dist = d.dot(bn);
-  const radial = d.clone().sub(bn.clone().multiplyScalar(dist)).length();
   const prevDist = o.prevDist;
   o.prevDist = dist;
-  if (prevDist === undefined || radial > BLADE_R + BALL_R * 0.6) return false;
+  if (prevDist === undefined) return false;
+  bu.set(0, 1, 0).applyQuaternion(iq); bv.set(0, 0, 1).applyQuaternion(iq);
+  if (!overBlade(d.dot(bu), d.dot(bv), BALL_R * 0.6)) return false;
   const touching = Math.abs(dist) < BALL_R + 0.005;
   const crossed = Math.sign(dist) !== Math.sign(prevDist);
   if (!touching && !crossed) return false;
   if (S.time - o.lastHit < 0.08) return false;
   const side = Math.sign(prevDist) || 1;
   const n = bn.clone().multiplyScalar(side);
-  // world velocity of paddle surface; in slowed time the paddle moves "faster" relative to the sim
-  const pv = padPointVel(bp, frameDt).multiplyScalar(1 / simScale);
-  const before = P.copy(o.b.v);
-  const impact = P.contact(o.b, P.v3(n.x, n.y, n.z), P.v3(pv.x, pv.y, pv.z), 0.82, 0.8);
+  // paddle surface velocity as tracked. Ball speed below 100% slows the ball's clock only, so your shot
+  // travels the same path it would at full speed (dividing by the scale here made every shot too strong).
+  const pv = padPointVel(bp, frameDt);
+  const before = P.copy(o.b.v), wBefore = P.copy(o.b.w), pBefore = P.copy(o.b.p);
+  const impact = P.contact(o.b, P.v3(n.x, n.y, n.z), P.v3(pv.x, pv.y, pv.z), P.RUBBER.e, P.RUBBER.mu, P.RUBBER.et);
   if (impact <= 0) return false;
   const out = bc.clone().add(bn.clone().multiplyScalar(side * (BALL_R + 0.0045))).add(d.clone().sub(bn.clone().multiplyScalar(dist)));
   o.b.p = P.v3(out.x, out.y, out.z);
   o.prevDist = side * (BALL_R + 0.0045);
   o.lastHit = S.time;
+  const afterV = P.copy(o.b.v), afterW = P.copy(o.b.w);
   if (o.current) P.applyAssist(o.b, ASSIST_DV[settings.assist]);
+  if (o.current && o.rec && !o.rec.done && o.rec.hits.length < 4) {
+    o.rec.hits.push({
+      t: Math.round((S.time - frameDt * (1 - a) - o.rec.t0) * 1e4) / 1e4, a, frameDt: Math.round(frameDt * 1e5) / 1e5,
+      side: side === redSign() ? 'red' : 'black', n: vround(n), pv: vround(pv),
+      bIn: { p: vround(pBefore), v: vround(before), w: vround(wBefore) }, bOut: { v: vround(afterV), w: vround(afterW) },
+      bOutAssist: vround(o.b.v), assistDv: vround(P.sub(o.b.v, afterV)), uv: { u: d.dot(bu), v: d.dot(bv) },
+    });
+  }
   const rel = P.len(P.sub(o.b.v, before));
-  sfx.paddle(rel * simScale);
+  sfx.paddle(rel);
   pulse(paddleIdx, Math.min(1, 0.35 + rel / 18), 28);
   return true;
 }
@@ -709,6 +774,132 @@ function updateBalls(dt, frameDt, padOk) {
   }
 }
 
+// ---------------------------------------------------------------- debug: recorder, readout, replay
+const SESSION = new Date().toISOString().slice(0, 16);
+const redSign = () => (settings.hand === 'left' ? 1 : -1);
+let db = null, dbState = 'connecting', savedCount = 0;
+(async () => {
+  try {
+    if (!window.claude?.use) { dbState = 'unavailable'; return; }
+    db = await window.claude.use('db');
+    dbState = db ? 'on' : 'unavailable';
+  } catch { dbState = 'unavailable'; }
+  if (S.screen === 'debug') menu.redraw();
+})();
+async function saveRec(rec) {
+  if (!settings.recorder || !db) return;
+  const { t0, finalizeAt, done, ...body } = rec;
+  body.fps = rec.frames.length > 1 ? Math.round((rec.frames.length - 1) / (rec.frames.at(-1)[0] - rec.frames[0][0])) : 0;
+  body.frameFormat = 't,px,py,pz,qx,qy,qz,qw,bx,by,bz (paddle mount pose + ball, table frame)';
+  body.readout = S.readout ? { head: S.readout.head, rows: S.readout.rows.map(r => r.join(': ')), tip: S.readout.tip } : null;
+  const id = `${rec.at}-${Math.random().toString(36).slice(2, 6)}`;
+  try { await db.collection('swings').doc(id).set(body); savedCount++; dbState = 'on'; }
+  catch (e) { dbState = e?.code || 'error'; }
+  if (S.screen === 'debug') menu.redraw();
+}
+function recordFrame() {
+  const rec = S.rec;
+  if (!rec || rec.done) return;
+  const b = S.cur && S.cur.rec === rec && S.cur.b ? S.cur.b.p : null;
+  if (rec.frames.length < 1200) rec.frames.push(frameRow(S.time - rec.t0, padCur.p, padCur.q, b));
+  if (S.time >= rec.finalizeAt) finalizeRec(rec);
+}
+function finalizeRec(rec) {
+  rec.done = true;
+  S.lastRec = rec;
+  try { S.readout = analyze(rec); } catch (e) { S.readout = { head: 'READOUT ERROR', tone: 'bad', rows: [['Error', String(e.message || e)]], tip: '' }; }
+  drawReadout();
+  saveRec(rec);
+}
+
+// Readout panel, to the player's left beside the net, turned to face them.
+const readPanel = new Panel(960, 720, 0.6);
+readPanel.mesh.position.set(-(W / 2 + 0.38), H + 0.62, 0.45);
+readPanel.mesh.rotation.y = Math.atan2(W / 2 + 0.38, L / 2 + 0.6 - 0.45);
+readPanel.mesh.visible = false;
+tableRoot.add(readPanel.mesh);
+function wrapText(p, str, x, y, maxW, size, color, lh) {
+  p.ctx.font = `400 ${size}px ${FONT_B}`;
+  let line = '', yy = y;
+  for (const w of str.split(' ')) {
+    const t = line ? line + ' ' + w : w;
+    if (p.ctx.measureText(t).width > maxW && line) { p.text(line, x, yy, { size, color }); line = w; yy += lh; } else line = t;
+  }
+  if (line) p.text(line, x, yy, { size, color });
+}
+function drawReadout() {
+  const inReplay = S.screen === 'replay';
+  const show = !!S.readout && (inReplay || (settings.readout && ['playing', 'paused'].includes(S.screen)));
+  readPanel.mesh.visible = show;
+  if (!show) return;
+  readPanel.setDraw(p => {
+    const r = S.readout;
+    p.frame();
+    p.text(inReplay ? 'REPLAY' : 'LAST SHOT', 60, 82, { size: 30, color: C.dim, font: FONT_D, weight: 700 });
+    p.text(r.head, 60, 140, { size: 56, font: FONT_D, weight: 700, color: r.tone === 'good' ? C.good : r.tone === 'bad' ? C.bad : C.fg });
+    r.rows.slice(0, 7).forEach(([k, v], i) => {
+      p.text(k, 60, 205 + i * 50, { size: 28, color: C.dim });
+      p.text(v, 230, 205 + i * 50, { size: 30, color: C.fg });
+    });
+    const tipY = 205 + Math.min(7, r.rows.length) * 50 + 20;
+    if (r.tip) wrapText(p, r.tip, 60, tipY, 840, 30, C.accent, 40);
+    if (inReplay) {
+      [[0.1, '10%'], [0.25, '25%'], [1, '100%']].forEach(([v, lbl], i) =>
+        p.button(`spd${i}`, lbl, 60 + i * 150, 600, 136, 76, { size: 32, active: R.speed === v, onClick: () => { R.speed = v; drawReadout(); } }));
+      p.button('exitReplay', 'EXIT REPLAY', 540, 600, 360, 76, { primary: true, size: 34, onClick: exitReplay });
+    }
+  });
+}
+
+// Replay: a ghost paddle and ball re-trace the recorded frames in slow motion, with both paths drawn.
+const ghost = new THREE.Group(); tableRoot.add(ghost); ghost.visible = false;
+const ghostPaddle = buildPaddle();
+ghostPaddle.group.traverse(m => { if (m.material) { m.material = (Array.isArray(m.material) ? m.material : [m.material]).map(mt => { const c = mt.clone(); c.transparent = true; c.opacity = 0.8; return c; }); } });
+const ghostMount = new THREE.Group(); ghostMount.add(ghostPaddle.group); ghost.add(ghostMount);
+const ghostBall = new THREE.Mesh(ballGeo, new THREE.MeshStandardMaterial({ color: '#ffd28a', emissive: '#663300' })); ghost.add(ghostBall);
+const contactMark = new THREE.Mesh(new THREE.TorusGeometry(0.03, 0.004, 8, 24), new THREE.MeshBasicMaterial({ color: '#5be3a1' })); ghost.add(contactMark);
+const mkLine = color => { const l = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color })); l.frustumCulled = false; ghost.add(l); return l; };
+const bladePath = mkLine('#ffffff'), ballPath = mkLine('#ff9a3c');
+const R = { rec: null, win: null, t: 0, speed: 0.25 };
+function startReplay() {
+  const rec = S.lastRec; if (!rec) return;
+  R.rec = rec; R.win = replayWindow(rec); if (!R.win) return;
+  R.t = R.win.start;
+  S.replayFrom = S.screen === 'playing' ? 'paused' : S.screen;
+  S.screen = 'replay';
+  balls.forEach(o => { o.mesh.visible = o.shadow.visible = o.trail.visible = false; });
+  ghostPaddle.setRedSide(rec.redSign);
+  const fr = rec.frames.filter(f => f[0] >= R.win.start - 0.05 && f[0] <= R.win.end + 0.05);
+  const q = new THREE.Quaternion();
+  bladePath.geometry.setFromPoints(fr.map(f => BLADE_C.clone().applyQuaternion(q.set(f[4], f[5], f[6], f[7])).add(new THREE.Vector3(f[1], f[2], f[3]))));
+  ballPath.geometry.setFromPoints(fr.filter(f => f[8] !== null).map(f => new THREE.Vector3(f[8], f[9], f[10])));
+  const h = rec.hits[0];
+  contactMark.visible = !!h;
+  if (h) { contactMark.position.set(h.bIn.p.x, h.bIn.p.y, h.bIn.p.z); contactMark.lookAt(tmpV.setFromMatrixPosition(camera.matrixWorld)); }
+  ghost.visible = true;
+  S.readout = analyze(rec);
+  showScreen();
+}
+function exitReplay() {
+  ghost.visible = false;
+  balls.forEach(o => { if (o.b) { o.mesh.visible = o.shadow.visible = true; o.trail.visible = settings.spinFx; } });
+  S.screen = S.replayFrom || 'paused';
+  showScreen();
+}
+const gq0 = new THREE.Quaternion(), gq1 = new THREE.Quaternion();
+function updateReplay(dt) {
+  const f = R.rec.frames;
+  R.t += dt * R.speed;
+  if (R.t > R.win.end + 0.5 * R.speed) R.t = R.win.start;
+  const t = Math.min(R.t, R.win.end);
+  let i = f.findIndex(x => x[0] > t); if (i <= 0) i = Math.max(1, f.length - 1);
+  const A = f[i - 1], B = f[i], k = THREE.MathUtils.clamp((t - A[0]) / ((B[0] - A[0]) || 1), 0, 1);
+  ghostMount.position.set(A[1] + (B[1] - A[1]) * k, A[2] + (B[2] - A[2]) * k, A[3] + (B[3] - A[3]) * k);
+  ghostMount.quaternion.slerpQuaternions(gq0.set(A[4], A[5], A[6], A[7]), gq1.set(B[4], B[5], B[6], B[7]), k);
+  ghostBall.visible = A[8] !== null && B[8] !== null;
+  if (ghostBall.visible) ghostBall.position.set(A[8] + (B[8] - A[8]) * k, A[9] + (B[9] - A[9]) * k, A[10] + (B[10] - A[10]) * k);
+}
+
 // ---------------------------------------------------------------- main loop
 const clock = new THREE.Clock();
 const headPos = new THREE.Vector3();
@@ -750,14 +941,16 @@ renderer.setAnimationLoop(() => {
     S.time += dt; S.playTime += dt;
     if (S.time >= S.nextFeedAt - 0.6 && !S.pendingShot && S.nextFeedAt !== Infinity) {
       const level = S.mode === 'rally' ? DIFF_LEVEL[settings.difficulty] + S.rally : DIFF_LEVEL[settings.difficulty];
-      S.pendingShot = makeShot(level);
+      S.pendingShot = nextShot();
     }
     if (S.time >= S.nextFeedAt) feed();
     if (S.time >= S.finishAt) { S.finishAt = Infinity; finishRun(); }
     updateBalls(dt, dt, padOk);
+    if (padOk) recordFrame();
     trackWorkout(dt, dt);
     drawHud();
   }
+  if (S.screen === 'replay') updateReplay(dt);
   // machine cue light and aim
   const cue = S.nextFeedAt !== Infinity && playing ? THREE.MathUtils.clamp(1 - (S.nextFeedAt - S.time) / 0.6, 0, 1) : 0;
   machineLight.color.setRGB(0.25 + cue * 0.75, 0.13 + cue * 0.35, 0.04);

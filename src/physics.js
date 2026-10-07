@@ -10,6 +10,8 @@ export const KM = 0.0012;            // Magnus: a = KM (ω × v)
 export const SPIN_DECAY = 0.12;      // 1/s, air slowly bleeds spin
 
 export const TABLE = { L: 2.74, W: 1.525, H: 0.76, NET_H: 0.1525, NET_HALF_W: 0.915 };
+// Paddle rubber: bounce, grip and tangential rebound. Tuned so brushing topspin strokes behave like real inverted rubber.
+export const RUBBER = { e: 0.7, mu: 1.5, et: 0.5 };
 export const SURFACE_Y = TABLE.H + BALL_R; // ball centre height when resting on the table
 
 export const v3 = (x = 0, y = 0, z = 0) => ({ x, y, z });
@@ -34,7 +36,8 @@ function accel(v, w) {
 
 // Impulse contact against a surface with normal n moving at surfVel.
 // Handles bounce (restitution e) and friction (mu) that trades speed for spin and back.
-export function contact(ball, n, surfVel, e, mu) {
+// et > 0 models grippy rubber: the ball leaves "over-rolling" (slip reversed by et), as inverted rubber does.
+export function contact(ball, n, surfVel, e, mu, et = 0) {
   const vr = sub(ball.v, surfVel);
   const vn = dot(vr, n);
   if (vn >= 0) return 0;
@@ -47,7 +50,7 @@ export function contact(ball, n, surfVel, e, mu) {
   if (vtLen > 1e-6) {
     // Impulse that would stop slipping completely (ball rolls off the surface): m|vt| / (1 + m r²/I) = 0.4 m |vt|
     const jStick = vtLen * BALL_M / (1 + BALL_M * BALL_R * BALL_R / BALL_I);
-    const jt = Math.min(mu * jn, jStick);
+    const jt = Math.min(mu * jn, (1 + et) * jStick);
     jtVec = scale(vt, -jt / vtLen);
   }
   const J = add(scale(n, jn), jtVec);
