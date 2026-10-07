@@ -1,0 +1,122 @@
+<title>TopSpin VR</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Saira+Condensed:wght@500;700&family=Atkinson+Hyperlegible:wght@400;700&display=swap">
+<style>
+  /* Layout: the live 3D table orbits behind; one start card styled like a table half (white side lines, centre line) floats on the left. */
+  :root {
+    --bg: #0a1a2e;
+    --table: rgba(20, 62, 112, 0.9);
+    --line: #f3f6fa;
+    --fg: #f4f8fc;
+    --dim: #a9bdd3;
+    --ball: #ff7a1a;
+    --ball-ink: #241000;
+    --display: "Saira Condensed", "Arial Narrow", sans-serif;
+    --body: "Atkinson Hyperlegible", "Segoe UI", system-ui, sans-serif;
+    color-scheme: dark;
+  }
+  html, body { height: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 400 16px/1.5 var(--body); overflow: hidden; }
+  #scene { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+  .wrap { position: relative; height: 100%; overflow-y: auto; padding-inline: 16px; padding-block: 24px; box-sizing: border-box; }
+  @media (min-width: 760px) { .wrap { padding-inline: 6vw; padding-block: 7vh; } }
+  .card {
+    position: relative; max-width: 31rem; background: var(--table); border: 3px solid var(--line); border-radius: 6px;
+    padding: 28px 28px 24px; display: grid; gap: 20px; box-shadow: 0 30px 80px rgba(0, 0, 0, 0.45);
+  }
+  .card::before { /* the table's centre line */
+    content: ""; position: absolute; top: 0; bottom: 0; left: 50%; width: 1px; background: rgba(243, 246, 250, 0.22); pointer-events: none;
+  }
+  .card > * { position: relative; }
+  .eyebrow { margin: 0; font: 500 0.95rem/1 var(--display); letter-spacing: 0.18em; text-transform: uppercase; color: var(--dim); }
+  h1 { margin: 6px 0 0; font: 700 clamp(3rem, 11vw, 4.6rem)/0.9 var(--display); letter-spacing: 0.01em; text-wrap: balance; }
+  h1 .ball { display: inline-block; width: 0.32em; height: 0.32em; border-radius: 50%; background: var(--ball); vertical-align: 0.5em; margin-left: 0.08em; }
+  p { margin: 0; color: var(--dim); max-width: 60ch; }
+  .lead { color: var(--fg); font-size: 1.05rem; }
+  .actions { display: flex; flex-wrap: wrap; gap: 10px; }
+  button {
+    font: 700 1.1rem/1 var(--display); letter-spacing: 0.06em; text-transform: uppercase; color: var(--fg); cursor: pointer;
+    border-radius: 6px; padding: 14px 18px; border: 2px solid var(--line); background: transparent;
+  }
+  button:hover { background: rgba(243, 246, 250, 0.12); }
+  button:focus-visible, input:focus-visible { outline: 3px solid var(--ball); outline-offset: 2px; }
+  button.primary { background: var(--ball); border-color: var(--ball); color: var(--ball-ink); font-size: 1.25rem; padding: 16px 22px; }
+  button.primary:hover { background: #ff9447; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  .note { font-size: 0.95rem; }
+  .specs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 0; }
+  .specs div { border-top: 1px solid rgba(243, 246, 250, 0.35); padding-top: 6px; min-width: 0; }
+  .specs dt { font-size: 0.78rem; color: var(--dim); }
+  .specs dd { margin: 0; font: 700 1.25rem/1.2 var(--display); font-variant-numeric: tabular-nums; }
+  h2 { margin: 0; font: 700 1rem/1 var(--display); letter-spacing: 0.14em; text-transform: uppercase; color: var(--dim); }
+  section { display: grid; gap: 10px; }
+  #bests { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
+  #bests li { display: flex; justify-content: space-between; gap: 12px; }
+  #bests b { font: 700 1.2rem var(--display); font-variant-numeric: tabular-nums; color: var(--ball); }
+  .field { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .field label { color: var(--dim); }
+  .field input { width: 5.5rem; font: 700 1.1rem var(--display); color: var(--fg); background: rgba(0, 0, 0, 0.25); border: 1px solid rgba(243, 246, 250, 0.5); border-radius: 4px; padding: 6px 8px; }
+  details { border-top: 1px solid rgba(243, 246, 250, 0.35); padding-top: 12px; }
+  summary { cursor: pointer; font: 700 1.05rem var(--display); letter-spacing: 0.06em; }
+  details ol { margin: 8px 0 0; padding-left: 1.2rem; color: var(--dim); display: grid; gap: 6px; }
+  .ingame-hint { position: fixed; left: 16px; bottom: 16px; font: 500 1rem var(--display); color: var(--dim); letter-spacing: 0.06em; display: none; }
+  body.in-game .wrap { display: none; }
+  body.in-game .ingame-hint { display: block; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<canvas id="scene" aria-label="TopSpin VR game view"></canvas>
+
+<div class="wrap">
+  <main class="card">
+    <div>
+      <p class="eyebrow">Mixed-reality table tennis · Meta Quest 3</p>
+      <h1>TopSpin VR<span class="ball" aria-hidden="true"></span></h1>
+    </div>
+    <p class="lead">A ball machine feeds you real topspin, backspin and sidespin. Return each ball onto the far half of the table. In drills, aim for the orange ring.</p>
+    <div class="actions">
+      <button class="primary" id="enter-ar" type="button" disabled>Start in your room</button>
+      <button id="enter-vr" type="button" hidden disabled>Virtual room</button>
+      <button id="play-desktop" type="button">Try on desktop</button>
+    </div>
+    <p class="note" id="xr-note" role="status">Checking for a headset…</p>
+
+    <dl class="specs" aria-label="Table size">
+      <div><dt>Table</dt><dd>2.74 × 1.525 m</dd></div>
+      <div><dt>Net</dt><dd>15.25 cm</dd></div>
+      <div><dt>Ball</dt><dd>40 mm · 2.7 g</dd></div>
+    </dl>
+
+    <section aria-labelledby="best-h">
+      <h2 id="best-h">Your best</h2>
+      <ul id="bests"></ul>
+      <p class="note" id="bests-empty">No runs yet.</p>
+      <div class="field">
+        <label for="weight">Body weight for the calorie estimate</label>
+        <input id="weight" type="number" min="30" max="250" step="1" inputmode="numeric"> <span class="note">kg</span>
+      </div>
+    </section>
+
+    <details>
+      <summary>Playing on Quest</summary>
+      <ol>
+        <li>Open this page in the <b>Meta Quest Browser</b> and press <b>Start in your room</b>. Allow passthrough if asked.</li>
+        <li>Stand in a clear space. The table appears just in front of you; use <b>Recenter table</b> any time to move it.</li>
+        <li>The paddle is in your right hand. Change hand, paddle angle, assists and ball speed in <b>Settings</b>.</li>
+        <li>Point at the menu and pull the trigger to choose. Press <b>B</b> or <b>Y</b> to pause.</li>
+        <li>Spin trails show the spin: <b style="color:#ff5a3c">red</b> topspin, <b style="color:#3cb4ff">blue</b> backspin, <b style="color:#c58cff">violet</b> sidespin.</li>
+      </ol>
+    </details>
+    <details>
+      <summary>Desktop controls</summary>
+      <ol>
+        <li>Move the mouse to place the paddle. Click and hold to swing forward through the ball.</li>
+        <li>Click menu buttons to choose. <kbd>Esc</kbd> pauses, or leaves from the main menu.</li>
+      </ol>
+    </details>
+  </main>
+</div>
+<p class="ingame-hint">Click to swing · Esc pauses</p>
+
+<script src="game.js?v=2"></script>
